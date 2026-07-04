@@ -5,7 +5,7 @@ import shutil
 import numpy as np
 import torch
 from generate_edge_list import parse_and_load, export_edges_to_file
-from train_model import load_graph, DiscreteLatentTransRotModel, train, get_title_map, most_similar
+from train_model import load_graph, PhaseTorusModel, train, get_title_map, most_similar
 
 def create_mock_files():
     mock_dir = "mock_data"
@@ -134,13 +134,13 @@ def verify():
     assert adj_matrix[0, 1] == True, "Adjacency matrix[0, 1] should be True"
     assert adj_matrix[1, 0] == False, "Adjacency matrix[1, 0] should be False"
     
-    # Step 4 Verification: Initialize and train DiscreteLatentTransRotModel
-    print("\n--- Verifying DiscreteLatentTransRotModel ---")
+    # Step 4 Verification: Initialize and train PhaseTorusModel
+    print("\n--- Verifying PhaseTorusModel ---")
     num_nodes = int(all_nodes.max() + 1)
     num_relations = 3
     embedding_dim = 16
     
-    model = DiscreteLatentTransRotModel(
+    model = PhaseTorusModel(
         num_nodes=num_nodes, 
         num_relations=num_relations, 
         embedding_dim=embedding_dim
@@ -158,14 +158,14 @@ def verify():
         lr=0.05
     )
     
-
+ 
     # Verify that model weights can be saved and loaded
     model_save_path = os.path.join("mock_data", "mock_model.pt")
     torch.save(model.state_dict(), model_save_path)
     assert os.path.exists(model_save_path), "Model weights file should be saved!"
     
     # Load weights into a new model instance
-    new_model = DiscreteLatentTransRotModel(
+    new_model = PhaseTorusModel(
         num_nodes=num_nodes, 
         num_relations=num_relations, 
         embedding_dim=embedding_dim

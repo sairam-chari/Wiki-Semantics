@@ -1,8 +1,8 @@
-# Wiki-Semantics: Large-Scale Semantic Embedding of Wikipedia via Discrete Latent Translation & Rotation
+# Wiki-Semantics: Large-Scale Semantic Embedding of Wikipedia via Phase-Torus Manifolds
 
 ## Abstract
 
-Wiki-Semantics is a framework for learning dense semantic representations of Wikipedia articles at scale. The system parses the full English Wikipedia hyperlink graph (~4.2M nodes, ~101M directed edges from the enwiki-2013 SNAP dataset), trains a **Discrete Latent Translation + Rotation Model** (TransRot) — which models relations as complex-space rotations combined with translations — on the resulting directed graph, and produces embeddings suitable for semantic similarity search across all Wikipedia articles. Unlike approaches based on text content, Wiki-Semantics derives semantic structure purely from hyperlink connectivity, capturing relational proximity (e.g., `Mars` → `Solar System` → `Jupiter`) without requiring raw article text.
+Wiki-Semantics is a framework for learning dense semantic representations of Wikipedia articles at scale. The system parses the full English Wikipedia hyperlink graph (~4.2M nodes, ~101M directed edges from the enwiki-2013 SNAP dataset), trains a **Phase-Torus Model** — which models relations as linear transformations on a unit interval manifold $[0, 1)$ — on the resulting directed graph, and produces embeddings suitable for semantic similarity search across all Wikipedia articles. Unlike approaches based on text content, Wiki-Semantics derives semantic structure purely from hyperlink connectivity, capturing relational proximity (e.g., `Mars` → `Solar System` → `Jupiter`) without requiring raw article text.
 
 ---
 
@@ -16,51 +16,34 @@ Wiki-Semantics bridges this gap by:
 1. Treating all Wikipedia hyperlinks as a directed graph with **implicit relational structure**.
 2. Learning a **codebook of K latent relation types** automatically from data, without manual relation annotation.
 3. Applying **degree-weighted loss** to prevent high-degree hub articles from dominating training.
-4. Implementing a **complex-space rotation + translation** model that resolves symmetries and hierarchical relationships.
+4. Implementing a **Phase-Torus formulation** that preserves structure intrinsically under modular arithmetic on a bounded, periodic latent space.
 5. Scaling to 4.2M nodes and 101M edges on a single consumer GPU.
 
 ---
 
 ## 2. Model Architecture
 
-### 2.1 Discrete Latent Translation & Rotation Model (TransRot)
+### 2.1 Phase-Torus Embedding Model (Unit Interval Manifold)
 
-The core model models relations using complex-space rotations combined with translations. For each directed edge $(h, t)$:
+The core model models relations using linear transformations on a periodic D-dimensional unit torus.
 
-**Node Embeddings**: Each node $i$ maps to a vector $\mathbf{e}_i \in \mathbb{R}^D$ where $D$ is the embedding dimension. The vector is normalized to the unit sphere on the fly during the forward pass and treated as $D/2$ complex numbers $\mathbf{e}_i \in \mathbb{C}^{D/2}$.
+**Node Embeddings**: Each node $i$ maps to a vector $\mathbf{\theta}_i = (\theta_{i,1}, \theta_{i,2}, \dots, \theta_{i,D})$ where each component is a phase variable in $[0, 1)$. This defines a D-dimensional torus $(\mathbb{R}/\mathbb{Z})^D$. There is no Cartesian representation, nor normalization, spheres, rotations, or quaternions.
 
-**Relation Codebook**: A set of $K$ learnable relation rotations $\{\theta_1, \dots, \theta_K\} \subset \mathbb{R}^{D/2}$ and relation translation vectors $\{r_1, \dots, r_K\} \subset \mathbb{R}^D$. These capture different types of Wikipedia linkage (e.g., "is an instance of", "is related to", "is part of") without supervision. Unlike models with unit-normalized translations, the scale of translation vectors $r_k$ is unconstrained to allow them to shrink to zero during training, which encourages close clustering.
+To ensure smooth optimization without discontinuities, each node stores an unconstrained parameter vector $\phi_i \in \mathbb{R}^D$ which is converted to phase space dynamically:
+$$\mathbf{\theta}_i = \phi_i \bmod 1$$
 
-**Relation Assignment**: For each edge $(h, t)$, the model dynamically selects the best-fitting relation:
-$$k^* = \arg\min_{k \in [K]} \| \text{rotate}(\mathbf{e}_h, \theta_k) + r_k - \mathbf{e}_t \|_2$$
+**Relation Codebook**: A set of $K$ learnable relation transformations. Each relation acts as a residual update on phases using an affine transformation defined by a matrix $W_k \in \mathbb{R}^{D \times D}$ and a bias $b_k \in \mathbb{R}^D$.
 
-where $\text{rotate}(\mathbf{e}_h, \theta_k)$ rotates the $D/2$ complex coordinates of $h$ by angles $\theta_k$.
+**Relation Assignment & Residual Dynamics**: For each edge $(h, t)$, the model applies the relation transformation in phase space:
+$$\theta'_{h, k} = (\theta_h + W_k \theta_h + b_k) \bmod 1$$
 
-**Translation Distance**: Using the selected relation:
-$$d(h, t) = \| \text{rotate}(\mathbf{e}_h, \theta_{k^*}) + r_{k^*} - \mathbf{e}_t \|_2$$
+The best-fitting relation is selected dynamically by minimizing the periodic distance to the target node:
+$$k^* = \arg\min_{k \in [K]} d(\theta'_{h, k}, \theta_t)$$
 
-### 2.1.1 Non-Commutativity and Relation Composition
-
-A critical mathematical feature of the TransRot architecture is that relationship composition is **non-commutative (order-dependent)**. This distinguishes it from models like TransE (translation-only) and RotatE (rotation-only) where relationship composition is commutative.
-
-#### Mathematical Derivation:
-If we apply two relationship transformations sequentially to a node embedding $\mathbf{h}$:
-1. **Path A (Relation 1 then Relation 2)**:
-   $$T_2(T_1(\mathbf{h})) = \text{rotate}(\mathbf{h}, \theta_1 + \theta_2) + \text{rotate}(r_1, \theta_2) + r_2$$
-2. **Path B (Relation 2 then Relation 1)**:
-   $$T_1(T_2(\mathbf{h})) = \text{rotate}(\mathbf{h}, \theta_2 + \theta_1) + \text{rotate}(r_2, \theta_1) + r_1$$
-
-Since rotating a translation vector changes its direction:
-$$\text{rotate}(r_1, \theta_2) + r_2 \neq \text{rotate}(r_2, \theta_1) + r_1$$
-
-Therefore, $T_2(T_1(\mathbf{h})) \neq T_1(T_2(\mathbf{h}))$.
-
-#### Semantic Importance:
-In real-world semantics, the order of relationship application matters. For instance:
-* `Seattle` $\xrightarrow{\text{located in}}$ `Washington` $\xrightarrow{\text{is a state of}}$ `United States` (Valid hierarchy, whereas the reverse order is semantically invalid).
-* In family relationships, $\text{Brother} \circ \text{Father} \implies \text{Uncle}$, whereas $\text{Father} \circ \text{Brother} \implies \text{Father}$.
-
-By maintaining non-commutative composition, TransRot avoids false semantic equivalences (like collapsing Uncle and Father) and can model complex directed paths and hierarchies.
+**Translation Distance**: Distance is computed respecting the circular wraparound for each dimension:
+$$\delta = \theta'_{h, k} - \theta_t$$
+$$\delta = \delta - \operatorname{round}(\delta)$$
+$$d(h, t) = \sum_{j=1}^D \delta_j^2$$
 
 ### 2.2 Loss Function
 
@@ -70,33 +53,18 @@ $$\mathcal{L}_{raw}(h, t) = \frac{1}{N} \sum_{n=1}^{N} \max(0,\ d(h, t) - d(h, \
 
 where $\gamma = 1.0$ is the margin hyperparameter.
 
-**Negative Distance Evaluation**: The distance for negative samples is evaluated under the same relation $k^*$ selected for the positive edge:
-$$d(h, \tilde{t}_n) = \| \text{rotate}(\mathbf{e}_h, \theta_{k^*}) + r_{k^*} - \mathbf{e}_{\tilde{t}_n} \|_2$$
-
-**Degree-Weighted Loss**: To prevent highly connected hub articles (e.g., "United States", "World War II") from dominating the gradient signal, each edge loss is weighted by the inverse square root of the combined degree:
-
+**Degree-Weighted Loss**: To prevent highly connected hub articles from dominating the gradient signal, each edge loss is weighted by the inverse square root of the combined degree:
 $$w(h, t) = \frac{1}{\sqrt{\deg(h) + \deg(t)}}$$
 
-where $\deg(v) = \text{in-degree}(v) + \text{out-degree}(v)$. Weights are normalized per batch to sum to 1:
+**Regularization**: Regularization targets only the transformation strength to prevent massive phase jumps, penalizing $\|W_k\|_2$, $\|b_k\|_2$, and the wrapped magnitude of $\theta'_{h, k^*} - \theta_h$. Node embeddings themselves are unconstrained in $\mathbb{R}^D$ and are not regularized for magnitude.
 
-$$\mathcal{L}_{margin} = \sum_{(h,t) \in \mathcal{B}} \frac{w(h,t)}{\sum_{(h',t') \in \mathcal{B}} w(h',t')} \cdot \mathcal{L}_{raw}(h, t)$$
+### 2.3 Inference: Periodic Distance Search
 
-**L2 Scale Regularization**: To reduce the scale of the relationship transformations and force related nodes to cluster closer together in the embedding space (so that $\text{rotate}(\mathbf{e}_h, \theta_k) + r_k \approx \mathbf{e}_h$, implying $\mathbf{e}_h \approx \mathbf{e}_t$), we add an L2 regularization term on both relation rotation angles ($\theta$) and relation translations ($r$):
+At inference time, semantic similarity between a query article $h$ and target candidate $t$ is computed using the periodic distance metric (no cosine similarity):
 
-$$\mathcal{L}_{reg} = \lambda \left( \|\Theta\|_2 + \|R\|_2 \right)$$
+$$\text{similarity}(h, t) = - \min_{k \in [K]} d(\theta'_{h, k}, \theta_t)$$
 
-where $\lambda = 10^{-4}$ is the regularization scale factor.
-
-The final loss optimized is:
-$$\mathcal{L} = \mathcal{L}_{margin} + \mathcal{L}_{reg}$$
-
-### 2.3 Inference: TransRot Energy Minimum Search
-
-At inference time, rather than using raw cosine similarity (which ignores the learned rotations and translations), semantic similarity between a query article $h$ and target candidate $t$ is computed using the model's actual energy distance metric:
-
-$$\text{similarity}(h, t) = -\min_{k \in [K]} \| \text{rotate}(\mathbf{e}_h, \theta_k) + r_k - \mathbf{e}_t \|_2$$
-
-We return the negative distance so that higher values (closer to 0) correspond to more similar pages. For efficient top-$k$ retrieval over 4.2M articles, the distance is vectorized using PyTorch `cdist` and evaluated in chunks of 50,000 targets to prevent GPU memory depletion (OOM).
+We return the negative distance so that higher values (closer to 0) correspond to more similar pages.
 
 ---
 
@@ -104,7 +72,7 @@ We return the negative distance so that higher values (closer to 0) correspond t
 
 | Hyperparameter | Value |
 |---|---|
-| Embedding dimension $D$ | 64 (must be even for TransRot) |
+| Embedding dimension $D$ | 64 |
 | Number of latent relations $K$ | 50 |
 | Negatives per edge $N$ | 5 |
 | Margin $\gamma$ | 1.0 |
@@ -116,9 +84,9 @@ We return the negative distance so that higher values (closer to 0) correspond t
 | Regularization scale $\lambda$ | $10^{-4}$ |
 | Hardware | CUDA GPU |
 
-**Embedding Normalization**: Node embeddings are normalized to the unit sphere on the fly during the model's forward pass to maintain numerical stability and ensure consistency.
+**Phase Modulo**: Node embeddings' unconstrained parameters $\phi$ are wrapped to the unit interval $[0, 1)$ on the fly during the model's forward pass via $\theta = \phi \bmod 1$.
 
-**Optimizer Split**: Node embeddings use SGD (zero optimizer state overhead, critical for fitting 4.2M × 64 = 268M parameters in VRAM), while the relation parameters (rotations and translations) use Adam for faster convergence.
+**Optimizer Split**: Node embeddings use SGD (zero optimizer state overhead, critical for fitting 4.2M × 64 = 268M parameters in VRAM), while the relation parameters (linear transformations $W$ and $b$) use Adam for faster convergence.
 
 ---
 
@@ -154,8 +122,8 @@ data/enwiki-2013.txt
         │
         ▼
 ┌───────────────────┐
-│  Step 4: Train    │  DiscreteLatentTransRotModel (Exclusive)
-│  TransRot         │  Degree-weighted margin-ranking loss
+│  Step 4: Train    │  PhaseTorusModel
+│  Phase-Torus      │  Degree-weighted margin-ranking loss
 │                   │  On-GPU negative sampling & L2 scale regularization
 │                   │  Relation usage monitoring (k_star histogram)
 └───────┬───────────┘
@@ -163,7 +131,7 @@ data/enwiki-2013.txt
         ▼
 ┌───────────────────┐
 │  Step 5: Save &   │  Checkpoint with metadata (epochs, batch size, timestamp)
-│  Inference        │  Cosine similarity search (chunked 500K at a time)
+│  Inference        │  Periodic distance search (chunked 50K at a time)
 └───────────────────┘
 ```
 
@@ -183,8 +151,8 @@ A companion analysis script for studying the structural properties of the Wikipe
 ### `verify_similar.py`
 
 Interactive similarity verification and model comparison tool:
-- Automatically discovers and loads the latest trained `transrot_model_*.pt` checkpoints from the `data/` directory.
-- Queries the embedding space using cosine similarity.
+- Automatically discovers and loads the latest trained `PTM_*.pt` checkpoints from the `data/` directory.
+- Queries the embedding space using periodic minimum energy distance.
 - Displays comparative, side-by-side results for multiple models.
 - Filters and displays only results where all compared models agree with a score above a configurable threshold (default: -1.5, representing energy/similarity).
 
@@ -194,13 +162,13 @@ Interactive similarity verification and model comparison tool:
 
 | File | Purpose |
 |---|---|
-| `train_model.py` | Graph loading, TransRot architecture, training loop, cosine similarity search |
+| `train_model.py` | Graph loading, PhaseTorus architecture, training loop, periodic distance search |
 | `verify_similar.py` | Load checkpoints and run side-by-side similarity comparisons |
 | `graph_shortest_paths.py` | Graph structural analysis and path distribution plots |
 | `generate_edge_list.py` | Parse Wikipedia SQL dumps into edge list format |
 | `data/enwiki-2013.txt` | Input edge list (SNAP format) |
 | `data/enwiki-2013-names.csv` | Node ID → article title mapping (also supports SQLite `.db` load in `get_title_map`) |
-| `data/transrot_model_*.pt` | Trained checkpoint (includes metadata) |
+| `data/PTM_*.pt` | Trained checkpoint (includes metadata) |
 
 ---
 
@@ -210,7 +178,7 @@ Interactive similarity verification and model comparison tool:
 # Install dependencies
 pip install numpy scipy pandas scikit-learn torch tqdm matplotlib
 
-# Train the model (uses DiscreteLatentTransRotModel exclusively)
+# Train the model (uses PhaseTorusModel)
 python train_model.py
 
 # Run side-by-side similarity comparisons on trained checkpoints
@@ -222,7 +190,7 @@ python graph_shortest_paths.py
 
 **Checkpoint naming convention**: Saved checkpoints include training metadata in the filename:
 ```
-transrot_model_YYYYMMDD_HHMM_e{epochs}_b{batch_size}.pt
+PTM_YYYYMMDD_HHMM_e{epoch}_of_{epochs}_b{batch_size}.pt
 ```
 
 ---

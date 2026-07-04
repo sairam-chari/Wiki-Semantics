@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 import pandas as pd
+from datetime import datetime
 
 def load_graph(edge_list_path):
     """Load directed graph with compact ID remapping to minimize memory.
@@ -70,100 +71,76 @@ def load_graph(edge_list_path):
     
     return edges, adj_matrix, all_nodes, orig_to_compact, compact_to_orig
 
+class PhaseTorusModel(nn.Module):
+    """Phase-Torus Model (Unit Interval Manifold).
 
-class DiscreteLatentTransRotModel(nn.Module):
-    """Discrete Latent Translation + Rotation model.
+    Each node stores an unconstrained parameter vector (phi) in R^D.
+    It is converted to phase space via theta = phi % 1.
+    Relations are represented as linear transformations in phase space:
+      theta' = (theta + W * theta + b) % 1
 
-    Extends the DLTM by replacing the additive mask with complex-space rotation:
-      d(h, t) = || rotate(h, theta_k) + r_k - t ||_2
-
-    where rotate() applies element-wise complex multiplication using
-    angles theta_k in R^(D/2), and r_k is the translation vector.
-    No masking — the rotation inherently gates dimension relevance
-    (small angles ~ identity, large angles ~ active transform).
-
-    Relation codebook of K types is auto-assigned (same as DLTM).
-    Requires embedding_dim to be even (for complex pairing).
+    Distance is computed using periodic metric on [0, 1):
+      d(a, b) = min(|a - b|, 1 - |a - b|)
     """
     def __init__(self, num_nodes, num_relations, embedding_dim):
-        assert embedding_dim % 2 == 0, "embedding_dim must be even for complex rotation"
         super().__init__()
         self.embedding_dim = embedding_dim
         self.num_relations = num_relations
-        self.D2 = embedding_dim // 2          # complex dimensionality
 
-        self.node_embeddings  = nn.Embedding(num_nodes,    embedding_dim)
-        self.relation_rot     = nn.Embedding(num_relations, self.D2)       # rotation angles theta
-        self.relation_trans   = nn.Embedding(num_relations, embedding_dim) # translation vectors r
+        self.node_embeddings = nn.Embedding(num_nodes, embedding_dim)
+        self.relation_W      = nn.Parameter(torch.empty(num_relations, embedding_dim, embedding_dim))
+        self.relation_b      = nn.Parameter(torch.empty(num_relations, embedding_dim))
 
-        nn.init.xavier_uniform_(self.node_embeddings.weight)
-        nn.init.uniform_(self.relation_rot.weight, -3.14159, 3.14159)      # angles in (-pi, pi)
-        nn.init.xavier_uniform_(self.relation_trans.weight)
-
-    def _rotate(self, x, theta):
-        """Apply complex rotation to x using angles theta.
-        x:     (B, D)    treated as D/2 complex numbers
-        theta: (K, D/2)  rotation angles per relation
-        Returns: (B, K, D) rotated embeddings for all K relations.
-        """
-        B  = x.shape[0]
-        K  = theta.shape[0]
-        D2 = self.D2
-
-        x_re = x[:, ::2].unsqueeze(1)   # (B, 1, D/2)
-        x_im = x[:, 1::2].unsqueeze(1)  # (B, 1, D/2)
-
-        cos_t = torch.cos(theta).unsqueeze(0)  # (1, K, D/2)
-        sin_t = torch.sin(theta).unsqueeze(0)  # (1, K, D/2)
-
-        rot_re = x_re * cos_t - x_im * sin_t  # (B, K, D/2)
-        rot_im = x_re * sin_t + x_im * cos_t  # (B, K, D/2)
-
-        # Interleave real and imag back into shape (B, K, D)
-        out = torch.zeros(B, K, self.embedding_dim, device=x.device)
-        out[:, :, ::2]  = rot_re
-        out[:, :, 1::2] = rot_im
-        return out
+        # Initialize phi uniformly in [0, 1)
+        nn.init.uniform_(self.node_embeddings.weight, 0.0, 1.0)
+        # Initialize W using Xavier normal initialization
+        nn.init.xavier_normal_(self.relation_W)
+        nn.init.zeros_(self.relation_b)
 
     def forward(self, heads, tails, neg_tails=None):
-        h = self.node_embeddings(heads)  # (B, D)
-        t = self.node_embeddings(tails)  # (B, D)
+        phi_h = self.node_embeddings(heads)  # (B, D)
+        phi_t = self.node_embeddings(tails)  # (B, D)
+        
+        # Center phi_h to [-0.5, 0.5] for the linear relation to preserve translation invariance
+        theta_h = phi_h - torch.round(phi_h)
 
-        # Unit-normalize node embeddings
-        h = h / (h.norm(dim=1, keepdim=True) + 1e-9)
-        t = t / (t.norm(dim=1, keepdim=True) + 1e-9)
+        # Apply relation linear transformation: (B, K, D)
+        delta_theta = torch.einsum('bd,kcd->bkc', theta_h, self.relation_W) + self.relation_b.unsqueeze(0)
+        phi_pred = phi_h.unsqueeze(1) + delta_theta  # (B, K, D)
 
-        theta = self.relation_rot.weight    # (K, D/2)
-        r     = self.relation_trans.weight  # (K, D)
+        # Compute periodic squared distance: d = sum((diff - round(diff))^2)
+        diff = phi_pred - phi_t.unsqueeze(1)  # (B, K, D)
+        delta_dist = diff - torch.round(diff)
+        dists = torch.sum(delta_dist ** 2, dim=-1)  # (B, K)
 
-        # Rotate h under all K relations: (B, K, D)
-        h_rot = self._rotate(h, theta)
+        # Select best relation
+        k_star = torch.argmin(dists, dim=1)  # (B,)
+        B_idx = torch.arange(len(heads), device=heads.device)
+        
+        # Regularize the raw update before wrapping to encourage small transformations
+        delta_theta_best = delta_theta[B_idx, k_star]  # (B, D)
+        
+        phi_pred_best = phi_pred[B_idx, k_star]  # (B, D)
 
-        # Score all K relations: (B, K)
-        t_exp = t.unsqueeze(1)    # (B, 1, D)
-        r_exp = r.unsqueeze(0)    # (1, K, D)
-        dists = torch.norm(h_rot + r_exp - t_exp, dim=2)  # (B, K)
-
-        # Select best-fitting relation
-        k_star = torch.argmin(dists, dim=1)              # (B,)
-        h_rot_best = h_rot[torch.arange(len(heads), device=heads.device), k_star]  # (B, D)
-        r_best     = r[k_star]                           # (B, D)
-
-        pos_dist = torch.norm(h_rot_best + r_best - t, dim=1)  # (B,)
+        diff_pos = phi_pred_best - phi_t
+        delta_pos = diff_pos - torch.round(diff_pos)
+        pos_dist = torch.sum(delta_pos ** 2, dim=-1)  # (B,)
 
         if neg_tails is not None:
-            t_neg = self.node_embeddings(neg_tails)            # (B, N, D)
-            t_neg = t_neg / (t_neg.norm(dim=2, keepdim=True) + 1e-9)
-
-            h_rot_exp = h_rot_best.unsqueeze(1)  # (B, 1, D)
-            r_exp_b   = r_best.unsqueeze(1)      # (B, 1, D)
-            neg_dist  = torch.norm(h_rot_exp + r_exp_b - t_neg, dim=2)  # (B, N)
-            return pos_dist, neg_dist, k_star
+            phi_neg = self.node_embeddings(neg_tails)  # (B, N, D)
+            
+            diff_neg = phi_pred_best.unsqueeze(1) - phi_neg  # (B, N, D)
+            delta_neg = diff_neg - torch.round(diff_neg)
+            neg_dist = torch.sum(delta_neg ** 2, dim=-1)  # (B, N)
+            
+            return pos_dist, neg_dist, k_star, delta_theta_best
 
         return pos_dist
 
     def translation_distance(self, heads, tails):
         return self.forward(heads, tails)
+
+
 
 
 def sample_negatives_vectorized(heads, all_nodes, adj_matrix):
@@ -187,7 +164,7 @@ def sample_negatives_vectorized(heads, all_nodes, adj_matrix):
     
     return neg_tails
 
-def train(model, edges, adj_matrix, all_nodes, epochs=10, batch_size=1024, lr=0.01, margin=1.0, num_negatives=5, reg_scale=1e-6):
+def train(model, edges, adj_matrix, all_nodes, epochs=10, batch_size=1024, lr=0.01, margin=1.0, num_negatives=5, reg_scale=1e-6, save_prefix="model", model_type="DLAM"):
     # Ensure GPU/CUDA device is available
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required but not available. Please ensure a CUDA device is present.")
@@ -233,7 +210,7 @@ def train(model, edges, adj_matrix, all_nodes, epochs=10, batch_size=1024, lr=0.
                 neg_tails = torch.randint(0, num_nodes, (len(heads), num_negatives), device=device)
                 
                 # Forward pass using the model
-                pos_dist, neg_dist, k_star = model(heads, tails, neg_tails)
+                pos_dist, neg_dist, k_star, delta_theta_best = model(heads, tails, neg_tails)
                 
                 # Accumulate k_star counts to monitor relation usage
                 relation_counts += torch.bincount(k_star, minlength=model.num_relations)
@@ -250,8 +227,12 @@ def train(model, edges, adj_matrix, all_nodes, epochs=10, batch_size=1024, lr=0.
                 
                 base_loss = (per_sample_loss * weights).sum()
                 
-                # Add a factor in the loss that reduces the scale of the relationship transformations
-                reg_loss = reg_scale * (model.relation_rot.weight.norm(p=2) + model.relation_trans.weight.norm(p=2))
+                # Add L2 regularization on W, b, and delta_theta_best
+                reg_loss = reg_scale * (
+                    model.relation_W.norm(p=2) + 
+                    model.relation_b.norm(p=2) + 
+                    delta_theta_best.norm(p=2)
+                )
                 loss = base_loss + reg_loss
                 
                 optimizer.zero_grad(set_to_none=True)
@@ -275,6 +256,26 @@ def train(model, edges, adj_matrix, all_nodes, epochs=10, batch_size=1024, lr=0.
         for chunk in range(0, len(lines), 5):
             print("  " + " | ".join(lines[chunk:chunk+5]))
 
+        # Save checkpoint after every epoch
+        timestamp_str  = datetime.now().strftime("%Y%m%d_%H%M")
+        model_filename = f"{save_prefix}_{timestamp_str}_e{epoch+1}_of_{epochs}_b{batch_size}.pt"
+        model_path     = os.path.join(r"data", model_filename)
+        
+        os.makedirs(os.path.dirname(model_path), exist_ok=True)
+        checkpoint = {
+            'state_dict':    model.state_dict(),
+            'model_type':    model_type,
+            'epoch':         epoch + 1,
+            'epochs':        epochs,
+            'batch_size':    batch_size,
+            'num_relations': model.num_relations,
+            'embedding_dim': model.node_embeddings.weight.shape[1],
+            'num_negatives': num_negatives,
+            'timestamp':     datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        torch.save(checkpoint, model_path)
+        print(f"Model saved to {model_path} for epoch {epoch+1}")
+
 def get_title_map(names_csv_path):
     """Load the mapping from page IDs to titles from the enwiki-2013-names.csv file or SQLite database."""
     print(f"Loading title map from {names_csv_path}...")
@@ -291,51 +292,51 @@ def get_title_map(names_csv_path):
 
 def most_similar(model, compact_node_id, compact_to_orig, id_to_title, all_nodes, topn=5):
     """Find nearest nodes by minimum energy (distance) across all latent relations.
-    
-    Instead of raw cosine similarity, this computes the proper translation+rotation
-    distance: d(h, t) = min_k || rotate(h, theta_k) + r_k - t ||_2
+     Instead of raw cosine similarity, this computes the periodic translation
+    distance: d(h, t) = min_k || (h + W_k h + b_k) - t || in [0,1) phase space.
     
     Uses chunked computation to prevent GPU memory depletion.
     """
     with torch.no_grad():
-        target_idx = torch.tensor([compact_node_id], dtype=torch.long, device=model.node_embeddings.weight.device)
-        h = model.node_embeddings(target_idx)
-        h = h / (h.norm(dim=1, keepdim=True) + 1e-9)
+        target_tensor = torch.tensor([compact_node_id], dtype=torch.long, device=model.node_embeddings.weight.device)
+        # target_phi shape: (1, D)
+        target_phi = model.node_embeddings(target_tensor)
+        target_theta = target_phi - torch.round(target_phi)
         
-        theta = model.relation_rot.weight
-        r = model.relation_trans.weight
+        # Apply relation linear transformation: (1, K, D)
+        delta_theta = torch.einsum('bd,kcd->bkc', target_theta, model.relation_W) + model.relation_b.unsqueeze(0)
+        target_pred = target_phi.unsqueeze(1) + delta_theta  # (1, K, D)
         
-        h_rot = model._rotate(h, theta) # shape (1, K, D)
-        h_transformed = (h_rot.squeeze(0) + r) # shape (K, D)
+        all_dists = []
+        chunk_size = 50000
+        num_nodes = model.node_embeddings.weight.shape[0]
         
-        # Process in chunks to cap GPU memory usage
-        chunk_size = 50_000
-        best_sims = torch.full((topn,), -1000.0, device=h.device)
-        best_ids = torch.full((topn,), -1, dtype=torch.long, device=h.device)
-        
-        num_nodes = len(all_nodes)
-        for start in range(0, num_nodes, chunk_size):
-            end = min(start + chunk_size, num_nodes)
-            chunk_emb = model.node_embeddings.weight[start:end]
-            chunk_normed = chunk_emb / (chunk_emb.norm(dim=1, keepdim=True) + 1e-9)
+        for start_idx in range(0, num_nodes, chunk_size):
+            end_idx = min(start_idx + chunk_size, num_nodes)
+            chunk_tensor = torch.arange(start_idx, end_idx, device=model.node_embeddings.weight.device)
+            # chunk_phi shape: (C, D)
+            chunk_phi = model.node_embeddings(chunk_tensor)
             
-            # Compute distance between all targets in chunk and all K relation transforms
-            dists = torch.cdist(chunk_normed, h_transformed, p=2.0) # (N, K)
-            min_dists, _ = torch.min(dists, dim=1)                  # (N,)
-            chunk_sims = -min_dists                                 # Negative distance = similarity
+            # we want difference for each node in chunk across all relations: shape (C, K, D)
+            chunk_phi_exp = chunk_phi.unsqueeze(1)  # (C, 1, D)
             
-            # Zero out self-similarity
-            if start <= compact_node_id < end:
-                chunk_sims[compact_node_id - start] = -1000.0
+            diff = target_pred - chunk_phi_exp # broadcasting target_pred (1, K, D) -> (C, K, D)
+            delta_dist = diff - torch.round(diff)
+            # squared distance per relation: (C, K)
+            dists = torch.sum(delta_dist ** 2, dim=-1)
             
-            # Merge this chunk's top candidates with running best
-            combined_sims = torch.cat([best_sims, chunk_sims])
-            combined_ids = torch.cat([best_ids, torch.arange(start, end, device=h.device)])
-            top_k = torch.topk(combined_sims, topn)
-            best_sims = top_k.values
-            best_ids = combined_ids[top_k.indices]
+            # minimum squared distance over relations
+            min_dists, _ = torch.min(dists, dim=1)  # (C,)
+            all_dists.append(min_dists.cpu())
+            
+        all_dists = torch.cat(all_dists)
         
-        result_ids = best_ids.tolist()
+        # Zero out self-similarity
+        all_dists[compact_node_id] = 1000.0
+            
+        best_sims, best_indices = torch.topk(-all_dists, topn)
+        
+        result_ids = best_indices.tolist()
         result_sims = best_sims.tolist()
         
     return [(id_to_title.get(compact_to_orig.get(i, i), str(compact_to_orig.get(i, i))), s) 
@@ -344,30 +345,34 @@ def most_similar(model, compact_node_id, compact_to_orig, id_to_title, all_nodes
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Train Wiki Semantics Model")
+    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=16000, help="Batch size")
+    parser.add_argument("--embedding_dim", type=int, default=64, help="Embedding dimension")
+    parser.add_argument("--num_relations", type=int, default=50, help="Number of latent relations")
     args = parser.parse_args()
-
+ 
     working_db_path = r"data\wiki_graph_working.db"
     edge_list_path  = r"data\enwiki-2013.txt"
-
+ 
     # Run Step 3: Load graph as CSR adjacency matrix
     edges, adj_matrix, all_nodes, orig_to_compact, compact_to_orig = load_graph(edge_list_path)
-
+ 
     # ── Training config ───────────────────────────────────────────────────────
-    MODEL_TYPE    = "transrot"
+    MODEL_TYPE    = 'phase_torus'
     num_nodes     = len(all_nodes)
-    num_relations = 50
-    embedding_dim = 64    # must be even for transrot
-    epochs        = 10
-    batch_size    = 16000
+    num_relations = args.num_relations
+    embedding_dim = args.embedding_dim
+    epochs        = args.epochs
+    batch_size    = args.batch_size
     num_negatives = 5
-
-    print("\n[Step 4] Initializing and training Translation+Rotation Model (no masking)...")
-    model = DiscreteLatentTransRotModel(
+ 
+    print("\n[Step 4] Initializing and training PhaseTorusModel...")
+    model = PhaseTorusModel(
         num_nodes=num_nodes,
         num_relations=num_relations,
         embedding_dim=embedding_dim
     ).to("cuda")
-    model_prefix = "transrot_model"
+    model_prefix = "PTM"
 
     train(
         model=model,
@@ -376,7 +381,9 @@ if __name__ == "__main__":
         all_nodes=all_nodes,
         epochs=epochs,
         batch_size=batch_size,
-        num_negatives=num_negatives
+        num_negatives=num_negatives,
+        save_prefix=model_prefix,
+        model_type=MODEL_TYPE
     )
 
     # Save checkpoint with metadata
