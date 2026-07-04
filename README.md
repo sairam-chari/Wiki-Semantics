@@ -2,8 +2,26 @@
 
 ## Abstract
 
-Wiki-Semantics is a framework for learning dense semantic representations of Wikipedia articles at scale. The system parses the full English Wikipedia hyperlink graph (~4.2M nodes, ~101M directed edges from the enwiki-2013 SNAP dataset), trains a **Phase-Torus Model** — which models relations as linear transformations on a unit interval manifold $[0, 1)$ — on the resulting directed graph, and produces embeddings suitable for semantic similarity search across all Wikipedia articles. Unlike approaches based on text content, Wiki-Semantics derives semantic structure purely from hyperlink connectivity, capturing relational proximity (e.g., `Mars` → `Solar System` → `Jupiter`) without requiring raw article text.
+Wiki-Semantics is an experimental research project exploring whether large-scale semantic representations of Wikipedia can be learned using periodic latent manifolds. The project investigates Phase-Torus embeddings, latent relation discovery, and scalable training on the full English Wikipedia hyperlink graph (~4.2M nodes, ~101M directed edges from the enwiki-2013 SNAP dataset). The system parses the graph, trains a **Phase-Torus Model** — which models relations as linear transformations on a unit interval manifold $[0, 1)$ — and produces embeddings that are intended for semantic similarity search; current work focuses on improving retrieval quality.
 
+## Current Status
+
+This project is under active research.
+
+**Implemented:**
+- ✓ Full Wikipedia graph loader (4.2M nodes, 101M edges)
+- ✓ GPU training pipeline
+- ✓ Phase-Torus embedding model
+- ✓ Latent relation codebook
+- ✓ Approximate similarity search
+- ✓ Graph analysis tools
+
+**Currently investigating:**
+- Better relation parameterizations
+- Improved optimization on periodic manifolds
+- Initialization strategies
+- Retrieval quality
+- Benchmark evaluation against existing methods
 ---
 
 ## 1. Introduction
