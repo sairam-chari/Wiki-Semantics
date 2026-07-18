@@ -10,18 +10,15 @@ This project is under active research.
 
 **Implemented:**
 - ✓ Full Wikipedia graph loader (4.2M nodes, 101M edges)
-- ✓ GPU training pipeline
-- ✓ Phase-Torus embedding model
-- ✓ Latent relation codebook
-- ✓ Approximate similarity search
-- ✓ Graph analysis tools
+- ✓ Phase 1: Phase-Torus model with latent relation codebook
+- ✓ Phase 2: Direct Flat-Torus node embedding manifold ($D=64$, 32 independent angle pairs)
+- ✓ Degree-inverse Walker-Vose alias sampling (multi-processing CPU accelerated)
+- ✓ Fused CUDA & GPU-accelerated random walk co-occurrence extraction
+- ✓ Spring attraction warm-start pretraining
+- ✓ Bounded temperature-scaled InfoNCE contrastive loss
+- ✓ Live VRAM tracking, throughput logging (396k samples/s), and ETA estimation
+- ✓ Empirical distance-bucket monotonicity & topic cluster similarity verification
 
-**Currently investigating:**
-- Better relation parameterizations
-- Improved optimization on periodic manifolds
-- Initialization strategies
-- Retrieval quality
-- Benchmark evaluation against existing methods
 ---
 
 ## 1. Introduction
@@ -32,10 +29,10 @@ Existing graph embedding approaches (Node2Vec, LINE, HOPE) typically operate on 
 
 Wiki-Semantics bridges this gap by:
 1. Treating all Wikipedia hyperlinks as a directed graph with **implicit relational structure**.
-2. Learning a **codebook of K latent relation types** automatically from data, without manual relation annotation.
-3. Applying **degree-weighted loss** to prevent high-degree hub articles from dominating training.
-4. Implementing a **Phase-Torus formulation** that preserves structure intrinsically under modular arithmetic on a bounded, periodic latent space.
-5. Scaling to 4.2M nodes and 101M edges on a single consumer GPU.
+2. Learning a **codebook of K latent relation types** (Phase 1) or direct **Flat-Torus manifold directions** (Phase 2).
+3. Applying **degree-inverse alias sampling** to prevent high-degree hub articles from dominating training.
+4. Implementing a **Phase-Torus formulation** that preserves structure intrinsically under modular arithmetic on a bounded, periodic latent space ($\|\mathbf{x}\| = \sqrt{32}$ constant norm by construction).
+5. Scaling to 4.2M nodes and 101M edges on a single consumer GPU (2.24 GB VRAM footprint).
 
 ---
 
@@ -123,7 +120,7 @@ The system uses the **enwiki-2013 SNAP dataset** (Stanford Network Analysis Proj
 
 Required files in `data/`:
 - `enwiki-2013.txt` — edge list in SNAP format (src dst, whitespace-separated, `#` comment lines)
-- `enwiki-2013-names.csv` — node ID to article title mapping
+- `enwiki-2013-names.csv` — node ID to article title mapping (4,197,951 article titles)
 
 ---
 
@@ -140,39 +137,38 @@ data/enwiki-2013.txt
         │
         ▼
 ┌───────────────────┐
-│  Step 4: Train    │  PhaseTorusModel
-│  Phase-Torus      │  Degree-weighted margin-ranking loss
-│                   │  On-GPU negative sampling & L2 scale regularization
-│                   │  Relation usage monitoring (k_star histogram)
+│  Step 4: Train    │  PhaseTorusModel / TorusEmbedding
+│  Phase-Torus      │  Degree-inverse Vose alias walk co-occurrence
+│                   │  On-GPU negative sampling & InfoNCE contrastive loss
+│                   │  Live VRAM tracking & ETA estimation
 └───────┬───────────┘
         │
         ▼
 ┌───────────────────┐
-│  Step 5: Save &   │  Checkpoint with metadata (epochs, batch size, timestamp)
-│  Inference        │  Periodic distance search (chunked 50K at a time)
+│  Step 5: Save &   │  Checkpoint with metadata
+│  Inference        │  Cosine similarity & topic cluster evaluation
 └───────────────────┘
 ```
 
 ---
 
-## 6. Graph Analysis Tools
+## 6. Graph Analysis & Evaluation Tools
 
-### `graph_shortest_paths.py`
+### `phase2_run.py`
+CLI pipeline runner for Phase 2 flat-torus embeddings:
+- Loads Wikipedia directed graph (`data/phase2_graph.pt`).
+- Builds degree-inverse Walker-Vose alias tables (`data/phase2_alias.pt`).
+- Generates walk corpus and extracts co-occurrence positive pairs across window sizes (2, 5, 10).
+- Runs spring warm-start pretraining and InfoNCE main training loop with live throughput and VRAM stats.
 
-A companion analysis script for studying the structural properties of the Wikipedia hyperlink graph:
+### `verify_topic_clusters.py`
+Topic cluster cosine similarity verification script:
+- Maps 4.2M Wikipedia node IDs to title strings via `enwiki-2013-names.csv`.
+- Evaluates anchor topics (**Physics**, **Computer Science**, **Sports**) against in-cluster related subtopics vs. out-of-cluster negatives.
+- Exports visualization plot to `data/cluster_similarity_plot.png`.
 
-- **BFS Shortest Paths**: Computes shortest path distances from a source node to all reachable nodes using SciPy's C-level BFS.
-- **Node-Disjoint Alternative Paths**: Finds up to $N$ node-disjoint shortest paths between pairs using a greedy intermediate-node blocking strategy.
-- **Path Length Distribution**: Plots the distribution of the 1st through $N$-th shortest path lengths across target nodes.
-- **Variance Analysis**: Plots the variance of the $k$-th shortest path length across randomly sampled $(src, target)$ pairs.
-
-### `verify_similar.py`
-
-Interactive similarity verification and model comparison tool:
-- Automatically discovers and loads the latest trained `PTM_*.pt` checkpoints from the `data/` directory.
-- Queries the embedding space using periodic minimum energy distance.
-- Displays comparative, side-by-side results for multiple models.
-- Filters and displays only results where all compared models agree with a score above a configurable threshold (default: -1.5, representing energy/similarity).
+### `phase2_eval.py`
+Evaluates cosine similarity across held-out random walk step distances ($d \in \{1, 2, 5, 10, 20, \text{random}\}$).
 
 ---
 
@@ -180,39 +176,101 @@ Interactive similarity verification and model comparison tool:
 
 | File | Purpose |
 |---|---|
-| `train_model.py` | Graph loading, PhaseTorus architecture, training loop, periodic distance search |
-| `verify_similar.py` | Load checkpoints and run side-by-side similarity comparisons |
+| `phase2/` | Package containing `graph`, `alias`, `walker`, `model`, and `train` modules |
+| `phase2_run.py` | CLI main pipeline entry point |
+| `phase2_eval.py` | Distance bucket similarity evaluation script |
+| `verify_topic_clusters.py` | Topic cluster similarity evaluation script with title mapping |
+| `verify_phase2_unit.py` | Unit verification test suite for Phase 2 invariants |
+| `train_model.py` | Phase 1 model architecture and relation codebook training |
 | `graph_shortest_paths.py` | Graph structural analysis and path distribution plots |
 | `generate_edge_list.py` | Parse Wikipedia SQL dumps into edge list format |
 | `data/enwiki-2013.txt` | Input edge list (SNAP format) |
-| `data/enwiki-2013-names.csv` | Node ID → article title mapping (also supports SQLite `.db` load in `get_title_map`) |
-| `data/PTM_*.pt` | Trained checkpoint (includes metadata) |
+| `data/enwiki-2013-names.csv` | Node ID → article title mapping |
+| `data/phase2_checkpoint_e10.pt` | Trained Phase 2 model checkpoint |
 
 ---
 
 ## 8. Installation & Usage
 
 ```bash
-# Install dependencies
-pip install numpy scipy pandas scikit-learn torch tqdm matplotlib
+# Set up environment and install dependencies
+uv venv .venv
+source .venv/bin/activate
+uv pip install torch --index-url https://download.pytorch.org/whl/cu121
+uv pip install numpy scipy pandas tqdm matplotlib torch-cluster
 
-# Train the model (uses PhaseTorusModel)
-python train_model.py
+# Run full Phase 2 training pipeline on Wikipedia
+python phase2_run.py --edge_list data/enwiki-2013.txt --epochs 10 --warmstart_epochs 2
 
-# Run side-by-side similarity comparisons on trained checkpoints
-python verify_similar.py
+# Evaluate topic cluster similarity against negatives (with titles)
+python verify_topic_clusters.py
 
-# Analyze graph structure and path distributions
-python graph_shortest_paths.py
+# Evaluate walk distance bucket monotonicity
+python phase2_eval.py --checkpoint data/phase2_checkpoint_e10.pt
 ```
 
-**Checkpoint naming convention**: Saved checkpoints include training metadata in the filename:
+---
+
+## 9. Phase 2 Architecture & Design Decisions
+
+### 9.1 Phase-Torus Manifold vs. Hypersphere
+- **Flat Torus Parameterization**: Each node $n$ is parameterized by 32 independent phase angles $\mathbf{\theta}_n \in \mathbb{R}^{32}$ (unbounded float32). The forward pass maps angles to 64D Cartesian coordinates:
+  $$\mathbf{x}_n = \operatorname{interleave}(\cos\mathbf{\theta}_n, \sin\mathbf{\theta}_n) \in \mathbb{R}^{64}$$
+- **Intrinsic Constant Norm**: $\|\mathbf{x}_n\|_2 = \sqrt{32} \approx 5.6568$ identically for all nodes by construction ($\cos^2 \theta + \sin^2 \theta = 1$). No norm regularization or spherical projection needed.
+- **Why Torus over Hypersphere**: Standard hyperspherical product-chain coordinate systems suffer from severe **gimbal lock** and **vanishing gradients** near $\theta \to 0$ or $\pi$. The flat torus uses independent angle pairs, avoiding coupling and coordinate singularities completely.
+- **Dot Product & Cosine Similarity**:
+  $$\mathbf{x}_u \cdot \mathbf{x}_v = \sum_{i=1}^{32} \cos(\theta_{u,i} - \theta_{v,i}) \in [-32, 32], \quad \operatorname{cos\_sim}(u, v) = \frac{\mathbf{x}_u \cdot \mathbf{x}_v}{32.0} \in [-1, 1]$$
+
+### 9.2 Training Signal: Random Walk Co-occurrence vs. Exact APSP
+- **No APSP / BFS Distance Matrices**: All-Pairs Shortest Path at Wikipedia scale ($V = 4.2 \times 10^6$) requires $V^2 \approx 1.76 \times 10^{13}$ pairs, which is computationally and memory-wise infeasible on a single machine.
+- **Co-occurrence Proxies**: Graph distance distributions are captured via random walk co-occurrence windows ($w \in \{2, 5, 10\}$ for close, medium, and far proximity).
+
+### 9.3 Degree-Inverse Alias Sampling
+- **Hub Suppression**: Uniform random walks heavily oversample hub pages. To prevent hub dominance, transition probabilities $P(u \to v)$ are weighted by $1 / \operatorname{deg}(v)$.
+- **Walker-Vose Alias Tables**: Precomputed in $O(V+E)$ time once per corpus and stored in flat CSR arrays. Walk step transitions perform $O(1)$ alias lookups vectorized across batch dimensions.
+
+### 9.4 Loss Function: Bounded InfoNCE & Spring Warm-Start
+- **InfoNCE Loss**: Raw margin ranking losses suffer from runaway cosine collapse. Phase 2 uses temperature-scaled InfoNCE:
+  $$\mathcal{L}_{\text{InfoNCE}} = -\log \frac{\exp(\operatorname{cos\_sim}(a, p) / \tau)}{\exp(\operatorname{cos\_sim}(a, p) / \tau) + \sum_{k=1}^K \exp(\operatorname{cos\_sim}(a, n_k) / \tau)}$$
+- **Spring Warm-Start**: Pretrains torus angles for 1–2 epochs using local spring attraction ($\mathbf{x}_u \cdot \mathbf{x}_v$) and negative repulsion to avoid early local minima.
+
+### 9.5 Single Consumer Hardware Budget
+- **GPU (RTX 4070, 8GB VRAM)**: Holds node embeddings ($\theta \in \mathbb{R}^{4.2M \times 32}$, ~538 MB) and Adam optimizer state (~1 GB).
+- **CPU (32GB RAM)**: Stores edge index (~800 MB) and walk corpus (~6–7 GB), streaming mini-batches (16K–32K nodes) to GPU.
+
+### 9.6 Empirical Evaluation Results (Full Wikipedia Graph: 4.2M Nodes, 101M Edges)
+
+#### Walk Distance Bucket Monotonicity
+```text
+=================================================================
+Distance Bucket      | Mean Cosine  | Std Dev    | Min / Max      
+-----------------------------------------------------------------
+Walk Step 1 (Direct) |   +0.2529    |   0.2219   | -0.55 / 0.94
+Walk Step 2 (2-Hop)  |   +0.1585    |   0.2269   | -0.57 / 0.95
+Walk Step 5 (5-Hop)  |   +0.0625    |   0.2085   | -0.59 / 0.90
+Walk Step 10 (10-Hop)|   +0.0121    |   0.1867   | -0.65 / 0.87
+Walk Step 20 (20-Hop)|   -0.0103    |   0.1750   | -0.56 / 0.80
+Random / Far-Apart   |   +0.0015    |   0.1406   | -0.58 / 0.73
+=================================================================
 ```
-PTM_YYYYMMDD_HHMM_e{epoch}_of_{epochs}_b{batch_size}.pt
-```
+
+#### Topic Cluster Discrimination
+- **Physics Cluster (Anchor: "Physics")**:
+  - In-Cluster Mean: **`+0.7547`** (*Quantum mechanics*: `+0.8017`, *Albert Einstein*: `+0.7789`, *Thermodynamics*: `+0.7687`)
+  - Out-of-Cluster Negatives Mean: **`+0.2953`** (*Lady Gaga*: `+0.2675`, *Heavy metal*: `+0.2149`, *Hollywood*: `+0.1885`)
+  - **Cluster Separation Delta**: **`+0.4594`**
+- **Computer Science Cluster (Anchor: "Computer science")**:
+  - In-Cluster Mean: **`+0.7378`** (*Algorithm*: `+0.8025`, *Software engineering*: `+0.7942`, *Machine learning*: `+0.7818`)
+  - Out-of-Cluster Negatives Mean: **`+0.2353`** (*Heavy metal*: `-0.0244`, *Baseball*: `+0.2190`, *Shakespeare*: `+0.2502`)
+  - **Cluster Separation Delta**: **`+0.5025`**
+- **Sports Cluster (Anchor: "Association football")**:
+  - In-Cluster Mean: **`+0.3987`** (*FIFA World Cup*: `+0.7528`, *Rugby football*: `+0.6192`, *Basketball*: `+0.5100`)
+  - Out-of-Cluster Negatives Mean: **`+0.3024`** (*Psychology*: `+0.2827`, *Heavy metal*: `+0.1787`)
+  - **Cluster Separation Delta**: **`+0.0963`**
 
 ---
 
 ## License
 
 MIT License. Open-source and freely available for research and educational use.
+
